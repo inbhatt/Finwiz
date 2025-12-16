@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "570175770407",
+    "project_id": "finwiz-78e94",
+    "storage_bucket": "finwiz-78e94.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:570175770407:android:d7446162185a0a6f24a302",
+        "android_client_info": {
+          "package_name": "com.techpulse.finwiz"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCpSnA2w8Ptm0f1k7fzTdQ9BLyf0GLuhOQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
