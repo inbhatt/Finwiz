@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:finwiz/utils/db_utils.dart';
 import 'package:finwiz/utils/delta_api.dart';
 import 'package:finwiz/utils/utils.dart';
+import 'package:intl/intl.dart';
 
 class OptionChainService {
   static final OptionChainService _instance = OptionChainService._internal();
@@ -28,7 +29,14 @@ class OptionChainService {
 
   /// Saves detailed snapshot with correct rounding
   Future<void> saveSnapshot(String symbol, double spot, Map<String, Map<String, double>> expiryVolumes) async {
-    final Timestamp timestamp = DBUtils.getTimestamp();
+    String expiry;
+    var current = DateTime.now();
+    if (current.isAfter(DateTime(current.year, current.month, current.day, 17, 30))){
+      var next = current.add(Duration(days: 1));
+      expiry = DateFormat('dd-MM-yy').format(next);
+    }else{
+      expiry = DateFormat('dd-MM-yy').format(current);
+    }
 
     double globalCall = 0;
     double globalPut = 0;
@@ -48,16 +56,16 @@ class OptionChainService {
     });
 
     try {
-      await FirebaseFirestore.instance.collection(_collectionName).doc(timestamp.millisecondsSinceEpoch.toString()).set({
+      await FirebaseFirestore.instance.collection(_collectionName).doc().set({
         'symbol': symbol,
-        'timestamp': timestamp,
+        'timestamp': DBUtils.getTimestamp(expiry),
         'spot_price': spot,
         // FIX: Use correct Utils.round signature for totals
         'total_call_vol': Utils.round(2, num: globalCall, getAsDouble: true),
         'total_put_vol': Utils.round(2, num: globalPut, getAsDouble: true),
         'expiry_breakdown': roundedBreakdown,
       });
-      print("Saved snapshot: ${timestamp.toDate()}");
+      print("Saved snapshot: ${expiry}");
     } catch (e) {
       print("Error saving snapshot: $e");
     }

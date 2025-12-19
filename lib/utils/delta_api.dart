@@ -135,6 +135,7 @@ class DeltaApi {
         if (usdtWallet != null) {
           return double.parse(usdtWallet['balance'].toString());
         }
+        ShowDialogs.showDialog(title: 'Error', msg: response.body);
         return 0.0;
       }
     } catch (e) {

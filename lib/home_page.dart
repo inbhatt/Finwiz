@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:finwiz/login_page.dart';
 import 'package:finwiz/place_order_page.dart';
+import 'package:finwiz/services/option_chain_service.dart';
 import 'package:finwiz/utils/db_utils.dart';
 import 'package:finwiz/utils/delta_api.dart';
 import 'package:finwiz/utils/utils.dart';
@@ -46,6 +47,7 @@ class _HomePageState extends State<HomePage> {
     _fetchStocks();
     _fetchBalance();
     _connectWebSocket();
+    //OptionChainService().startBackgroundSync('BTC');
   }
 
   Future<void> _fetchBalance() async {
@@ -105,9 +107,13 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     try {
       final decodedMessage = jsonDecode(message);
-      if (decodedMessage['type'] == 'key-auth' && decodedMessage['success'] == true) {
-        setState(() => _isWebSocketAuthenticated = true);
-        _subscribeToChannels();
+      if (decodedMessage['type'] == 'key-auth') {
+        if (decodedMessage['success'] == true){
+          setState(() => _isWebSocketAuthenticated = true);
+          _subscribeToChannels();
+        }else{
+          ShowDialogs.showDialog(title: 'Error', msg: decodedMessage.toString());
+        }
       }
       if (_isWebSocketAuthenticated) {
         if (decodedMessage['type'] == 'v2/ticker') _handleTickerUpdate(decodedMessage);
@@ -633,5 +639,5 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildTableHeader(List<String> h, List<int> f) { return Row(children: List.generate(h.length, (i) => Expanded(flex: f[i], child: Text(h[i], style: const TextStyle(color: Colors.white54, fontSize: 12))))); }
-  @override void dispose() { _reconnectTimer?.cancel(); _channel?.sink.close(); super.dispose(); }
+  @override void dispose() { _reconnectTimer?.cancel(); _channel?.sink.close(); super.dispose(); OptionChainService().stopBackgroundSync();}
 }

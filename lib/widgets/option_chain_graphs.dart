@@ -21,8 +21,6 @@ class _OptionChainGraphsState extends State<OptionChainGraphs> {
   double _spotPrice = 0.0;
   bool _isLoadingStrikes = true;
 
-  // Expiry Logic
-  List<String> _expiryDates = [];
   String? _selectedExpiry;
 
   // Graph 2 Data
@@ -34,48 +32,21 @@ class _OptionChainGraphsState extends State<OptionChainGraphs> {
   @override
   void initState() {
     super.initState();
-    _selectedExpiry = DateFormat('dd-MM-yyyy').format(DateTime.now());
+    var current = DateTime.now();
+    if (current.isAfter(DateTime(current.year, current.month, current.day, 17, 30))){
+      var next = current.add(Duration(days: 1));
+      _selectedExpiry = DateFormat('dd-MM-yyyy').format(next);
+      _selectedHistoryDate = next;
+    }else{
+      _selectedExpiry = DateFormat('dd-MM-yyyy').format(current);
+    }
     _initData();
   }
 
   void _initData() async {
-    await _fetchExpiries();
     if (_selectedExpiry != null) {
       _fetchLiveStrikesAndSave();
       _fetchHistory();
-    }
-  }
-
-  Future<void> _fetchExpiries() async {
-    try {
-      final response = await DeltaApi.get('/v2/tickers?contract_types=call_options,put_options&underlying_asset_symbols=${widget.symbol}');
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final tickers = data['result'] as List;
-
-        Set<String> dates = {};
-        for(var t in tickers) {
-          if (t['expiry_date'] != null) dates.add(t['expiry_date']);
-        }
-
-        List<String> sortedDates = dates.toList();
-        sortedDates.sort((a, b) {
-          try {
-            return DateFormat('dd-MM-yyyy').parse(a).compareTo(DateFormat('dd-MM-yyyy').parse(b));
-          } catch(e) { return 0; }
-        });
-
-        if (mounted) {
-          setState(() {
-            _expiryDates = sortedDates;
-            if (!_expiryDates.contains(_selectedExpiry) && _expiryDates.isNotEmpty) {
-              _selectedExpiry = _expiryDates.first;
-            }
-          });
-        }
-      }
-    } catch (e) {
-      print("Expiry Fetch Error: $e");
     }
   }
 
@@ -118,9 +89,7 @@ class _OptionChainGraphsState extends State<OptionChainGraphs> {
 
           await OptionChainService().saveSnapshot(widget.symbol, currentSpot, expiryBreakdown);
 
-          if (_isSameDay(_selectedHistoryDate, DateTime.now())) {
-            _fetchHistory();
-          }
+          _fetchHistory();
 
           List<double> sortedStrikes = strikes.keys.toList()..sort();
           int nearestIndex = 0;
@@ -242,6 +211,7 @@ class _OptionChainGraphsState extends State<OptionChainGraphs> {
     );
     if (picked != null && picked != _selectedHistoryDate) {
       setState(() {
+        _selectedExpiry = DateFormat('dd-MM-yyyy').format(picked);
         _selectedHistoryDate = picked;
       });
       _fetchHistory();
@@ -257,23 +227,14 @@ class _OptionChainGraphsState extends State<OptionChainGraphs> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text("Expiry: ${_selectedExpiry ?? 'None'}", style: const TextStyle(color: Colors.white70, fontSize: 16)),
-              if (_expiryDates.isNotEmpty)
-                DropdownButton<String>(
-                  dropdownColor: const Color(0xFF1E2827),
-                  value: _expiryDates.contains(_selectedExpiry) ? _selectedExpiry : null,
-                  style: const TextStyle(color: Colors.white, fontSize: 16),
-                  items: _expiryDates.map((e) => DropdownMenuItem(value: e, child: Text(e, style: const TextStyle(color: Colors.white, fontSize: 16)))).toList(),
-                  onChanged: (val) {
-                    if (val != null) {
-                      setState(() => _selectedExpiry = val);
-                      _fetchLiveStrikesAndSave();
-                      _fetchHistory();
-                    }
-                  },
-                  underline: Container(),
-                  icon: const Icon(Icons.arrow_drop_down, color: Color(0xFF32F5A3)),
+              TextButton.icon(
+                onPressed: _pickDate,
+                icon: const Icon(Icons.calendar_today, color: Color(0xFF32F5A3), size: 20),
+                label: Text(
+                  DateFormat('dd MMM yyyy').format(_selectedHistoryDate),
+                  style: const TextStyle(color: Color(0xFF32F5A3), fontSize: 16),
                 ),
+              ),
             ],
           ),
           const SizedBox(height: 8),
@@ -291,14 +252,7 @@ class _OptionChainGraphsState extends State<OptionChainGraphs> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               const Text("Volume History (15m intervals)", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-              TextButton.icon(
-                onPressed: _pickDate,
-                icon: const Icon(Icons.calendar_today, color: Color(0xFF32F5A3), size: 20),
-                label: Text(
-                  DateFormat('dd MMM yyyy').format(_selectedHistoryDate),
-                  style: const TextStyle(color: Color(0xFF32F5A3), fontSize: 16),
-                ),
-              ),
+
             ],
           ),
 

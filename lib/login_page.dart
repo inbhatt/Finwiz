@@ -71,9 +71,8 @@ class _LoginPageState extends State<LoginPage> {
             ShowDialogs.dismissProgressDialog();
 
             if (paraDoc.documentSnapshot != null && paraDoc.documentSnapshot!.exists) {
-              final data = paraDoc.documentSnapshot!.data() as Map<String, dynamic>;
-              DeltaApi.apiKey = data['DELTA_API_KEY'];
-              DeltaApi.apiSecret = data['DELTA_API_SECRET'];
+              DeltaApi.apiKey = document.get('DELTA_API_KEY');
+              DeltaApi.apiSecret = document.get('DELTA_API_SECRET');
 
               Utils.prefs.setBool("REM_LOGIN", _rememberMe);
               if (_rememberMe) {
