@@ -7,10 +7,9 @@ import 'package:finwiz/utils/db_utils.dart';
 import 'package:finwiz/utils/delta_api.dart';
 import 'package:finwiz/utils/utils.dart';
 import 'package:finwiz/widgets/edit_order_dialog.dart';
-import 'package:finwiz/widgets/oi_chart.dart';
 import 'package:finwiz/widgets/show_dialogs.dart';
-import 'package:finwiz/widgets/volume_chart.dart';
 import 'package:flutter/material.dart';
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -31,94 +30,98 @@ class _HomePageState extends State<HomePage> {
   List<Map<String, dynamic>> _positions = [];
   List<Map<String, dynamic>> _orders = [];
   bool _isLoading = true;
-  late final WebSocketChannel _channel;
-  bool _isWebSocketAuthenticated = false;
 
-  Map<String, dynamic>? _selectedStock;
-  List<Map<String, dynamic>> _optionChainData = [];
-  bool _isOptionChainLoading = false;
-  String? _selectedExpiryDate;
-  double _spotPrice = 0.0;
-  Timer? _optionChainRefreshTimer;
+  WebSocketChannel? _channel;
+  bool _isWebSocketAuthenticated = false;
+  bool _isConnected = false;
+  Timer? _reconnectTimer;
+
+  final ValueNotifier<double> _btcPriceNotifier = ValueNotifier<double>(0.0);
+  double _userBalanceUsd = 0.0;
+  final double _usdToInr = 85.0;
 
   @override
   void initState() {
     super.initState();
-    _channel = WebSocketChannel.connect(
-      Uri.parse('wss://socket.india.delta.exchange'),
-    );
-
-    _authenticateAndSubscribe();
     _fetchStocks();
+    _fetchBalance();
+    _connectWebSocket();
   }
 
-  void _authenticateAndSubscribe() {
+  Future<void> _fetchBalance() async {
+    final balance = await DeltaApi.getUSDBalance();
+    if (mounted) {
+      setState(() {
+        _userBalanceUsd = balance;
+      });
+    }
+  }
+
+  void _connectWebSocket() {
+    if (_isConnected || _channel != null) return;
+    print("Attempting to connect to WebSocket...");
+    try {
+      _channel = WebSocketChannel.connect(Uri.parse('wss://socket.india.delta.exchange'));
+      _channel!.stream.listen(
+            (message) {
+          if (!_isConnected) setState(() => _isConnected = true);
+          _handleWebSocketMessage(message);
+        },
+        onError: (error) { print("WebSocket Error: $error"); _handleDisconnect(); },
+        onDone: () { print("WebSocket Connection Closed"); _handleDisconnect(); },
+      );
+      _authenticateWebSocket();
+    } catch (e) {
+      print("WebSocket Connection Failed: $e");
+      _handleDisconnect();
+    }
+  }
+
+  void _handleDisconnect() {
+    if (!mounted) return;
+    setState(() {
+      _isConnected = false;
+      _isWebSocketAuthenticated = false;
+      _channel = null;
+    });
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) { print("Reconnecting..."); _connectWebSocket(); }
+    });
+  }
+
+  void _authenticateWebSocket() {
     try {
       final signature = DeltaApi.getWebSocketAuthSignature();
       final timestamp = (DateTime.now().millisecondsSinceEpoch / 1000).round().toString();
-
-      _channel.sink.add(jsonEncode({
+      _channel?.sink.add(jsonEncode({
         'type': 'key-auth',
-        'payload': {
-          'api-key': DeltaApi.apiKey,
-          'signature': signature,
-          'timestamp': timestamp,
-        }
+        'payload': {'api-key': DeltaApi.apiKey, 'signature': signature, 'timestamp': timestamp}
       }));
+    } catch (e) { print("Auth Error: $e"); }
+  }
 
-      _channel.stream.listen(
-        (message) {
-          if (!mounted) return;
-          try {
-            final decodedMessage = jsonDecode(message);
-
-            if (decodedMessage['type'] == 'key-auth') {
-              if (decodedMessage['success'] == true) {
-                setState(() {
-                  _isWebSocketAuthenticated = true;
-                });
-                _subscribeToChannels();
-              } else {
-                ShowDialogs.showDialog(
-                    title: 'WebSocket Auth Error',
-                    msg: 'Authentication failed: ${decodedMessage['message'] ?? 'Unknown authentication error'}');
-              }
-            }
-
-            if (_isWebSocketAuthenticated) {
-              if (decodedMessage['type'] == 'v2/ticker') {
-                _handleTickerUpdate(decodedMessage);
-              } else if (decodedMessage['type'] == 'positions') {
-                _handlePositionUpdate(decodedMessage);
-              } else if (decodedMessage['type'] == 'orders') {
-                _handleOrderUpdate(decodedMessage);
-              }
-            }
-          } on FormatException catch (e) {
-            ShowDialogs.showDialog(title: 'WebSocket Data Error', msg: 'Failed to parse WebSocket message (invalid JSON): $e');
-          } catch (e) {
-            ShowDialogs.showDialog(title: 'WebSocket Processing Error', msg: 'An error occurred while processing WebSocket message: $e');
-          }
-        },
-        onError: (error) {
-          if (!mounted) return;
-          ShowDialogs.showDialog(title: 'WebSocket Connection Error', msg: 'WebSocket connection error: $error');
-        },
-        onDone: () {
-          if (!mounted) return;
-        },
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ShowDialogs.showDialog(title: 'WebSocket Initialization Error', msg: 'Failed to initialize WebSocket: $e');
-    }
+  void _handleWebSocketMessage(dynamic message) {
+    if (!mounted) return;
+    try {
+      final decodedMessage = jsonDecode(message);
+      if (decodedMessage['type'] == 'key-auth' && decodedMessage['success'] == true) {
+        setState(() => _isWebSocketAuthenticated = true);
+        _subscribeToChannels();
+      }
+      if (_isWebSocketAuthenticated) {
+        if (decodedMessage['type'] == 'v2/ticker') _handleTickerUpdate(decodedMessage);
+        else if (decodedMessage['type'] == 'positions') _handlePositionUpdate(decodedMessage);
+        else if (decodedMessage['type'] == 'orders') _handleOrderUpdate(decodedMessage);
+      }
+    } catch (e) { print("Message parsing error: $e"); }
   }
 
   void _handleTickerUpdate(Map<String, dynamic> data) {
     final productId = data['product_id'];
     final stockIndex = _stocks.indexWhere((s) => s['code'].toString() == productId.toString());
-
     if (stockIndex != -1) {
+      final close = double.tryParse(data['close'].toString()) ?? 0.0;
       setState(() {
         _stocks[stockIndex]['ltp'] = data['close'];
         _stocks[stockIndex]['open'] = data['open'];
@@ -126,6 +129,9 @@ class _HomePageState extends State<HomePage> {
         _stocks[stockIndex]['low'] = data['low'];
         _stocks[stockIndex]['close'] = data['close'];
       });
+      if (_stocks[stockIndex]['name'] == 'BTCUSD') {
+        _btcPriceNotifier.value = close;
+      }
     }
   }
 
@@ -136,14 +142,9 @@ class _HomePageState extends State<HomePage> {
       } else {
         final symbol = data['symbol'];
         final index = _positions.indexWhere((p) => p['symbol'] == symbol);
-
-        if (data['action'] == 'create') {
-          _positions.add(data);
-        } else if (data['action'] == 'update' && index != -1) {
-          _positions[index] = data;
-        } else if (data['action'] == 'delete' && index != -1) {
-          _positions.removeAt(index);
-        }
+        if (data['action'] == 'create') _positions.add(data);
+        else if (data['action'] == 'update' && index != -1) _positions[index] = data;
+        else if (data['action'] == 'delete' && index != -1) _positions.removeAt(index);
       }
     });
   }
@@ -153,28 +154,19 @@ class _HomePageState extends State<HomePage> {
       if (data['action'] == 'snapshot') {
         _orders = List<Map<String, dynamic>>.from(data['result']);
       } else {
-        final clientOrderId = data['client_order_id'];
-        final index = _orders.indexWhere((o) => o['client_order_id'] == clientOrderId);
+        final id = data['id'];
+        final index = _orders.indexWhere((o) => o['id'].toString() == id.toString());
 
-        if (data['action'] == 'create') {
-          _orders.add(data);
-        } else if (data['action'] == 'update' && index != -1) {
-          _orders[index] = data;
-        } else if (data['action'] == 'delete' && index != -1) {
-          _orders.removeAt(index);
-        }
+        if (data['action'] == 'create') _orders.add(data);
+        else if (data['action'] == 'update' && index != -1) _orders[index] = data;
+        else if (data['action'] == 'delete' && index != -1) _orders.removeAt(index);
       }
     });
   }
 
   Future<void> _fetchStocks() async {
     try {
-      final snapshot = await DBUtils.getData(
-        collection: "STOCKS",
-        condition: "PLATFORM=DELTA",
-        showProgress: false,
-      );
-
+      final snapshot = await DBUtils.getData(collection: "STOCKS", condition: "PLATFORM=DELTA", showProgress: false);
       if (mounted) {
         if (snapshot.querySnapshot != null && snapshot.querySnapshot!.docs.isNotEmpty) {
           final fetchedStocks = snapshot.querySnapshot!.docs.map((doc) {
@@ -183,385 +175,124 @@ class _HomePageState extends State<HomePage> {
               'name': doc.id,
               'short_name': data['NAME'],
               'code': data['CODE'],
-              'ltp': 'N/A',
-              'open': 'N/A',
-              'high': 'N/A',
-              'low': 'N/A',
-              'close': 'N/A',
+              'ltp': 'N/A', 'open': 'N/A', 'high': 'N/A', 'low': 'N/A', 'close': 'N/A',
             };
-          });
-
-          setState(() {
-            _stocks = fetchedStocks.toList();
-            _isLoading = false;
-          });
-
-          if (_isWebSocketAuthenticated) {
-            _subscribeToChannels();
-          }
+          }).toList();
+          setState(() { _stocks = fetchedStocks; _isLoading = false; });
+          if (_isWebSocketAuthenticated) _subscribeToChannels();
         } else {
-          setState(() {
-            _isLoading = false;
-          });
-          ShowDialogs.showDialog(title: 'Info', msg: 'No stocks found in Firestore.');
+          setState(() => _isLoading = false);
         }
       }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
-        ShowDialogs.showDialog(title: 'Error', msg: 'Failed to fetch stocks from Firestore: $e');
-      }
-    }
+    } catch (e) { if (mounted) setState(() => _isLoading = false); }
   }
 
   void _subscribeToChannels() {
+    if (_channel == null || !_isWebSocketAuthenticated) return;
     final symbols = _stocks.map((s) => s['name']).toList();
-    _channel.sink.add(jsonEncode({
+    _channel!.sink.add(jsonEncode({
       'type': 'subscribe',
       'payload': {
         'channels': [
-          {
-            'name': 'v2/ticker',
-            'symbols': symbols,
-          },
-          {
-            'name': 'positions',
-            'symbols': ['all'],
-          },
-          {
-            'name': 'orders',
-            'symbols': ['all'],
-          }
+          {'name': 'v2/ticker', 'symbols': symbols},
+          {'name': 'positions', 'symbols': ['all']},
+          {'name': 'orders', 'symbols': ['all']}
         ]
       }
     }));
   }
 
-  @override
-  void dispose() {
-    _channel.sink.close();
-    _optionChainRefreshTimer?.cancel();
-    super.dispose();
+  Future<void> _openOptionChainWindow(String symbol) async {
+    try {
+      final window = await DesktopMultiWindow.createWindow(jsonEncode({
+        'symbol': symbol,
+        'apiKey': DeltaApi.apiKey,
+        'apiSecret': DeltaApi.apiSecret,
+      }));
+      window..setFrame(const Offset(0, 0) & const Size(1000, 800))..center()..setTitle('$symbol Option Chain Graphs')..show();
+    } catch (e) { print("Error opening window: $e"); }
   }
 
-  void _showOrderDialog(Map<String, dynamic> stock, bool isBuy) {
+  Map<String, String> _getBracketsForDisplay(Map<String, dynamic> item, bool isPosition) {
+    String tp = '-';
+    String sl = '-';
+    if (isPosition) {
+      final relevantOrders = _orders.where((o) =>
+      o['product_id'].toString() == item['product_id'].toString() &&
+          (o['state'] == 'open' || o['state'] == 'pending')
+      ).toList();
+      final tpOrder = relevantOrders.firstWhere((o) => o['stop_order_type'] == 'take_profit_order', orElse: () => {});
+      if (tpOrder.isNotEmpty) tp = tpOrder['stop_price'].toString();
+      final slOrder = relevantOrders.firstWhere((o) => o['stop_order_type'] == 'stop_loss_order', orElse: () => {});
+      if (slOrder.isNotEmpty) sl = slOrder['stop_price'].toString();
+    } else {
+      if (item['bracket_take_profit_price'] != null) tp = item['bracket_take_profit_price'].toString();
+      if (item['bracket_stop_loss_price'] != null) sl = item['bracket_stop_loss_price'].toString();
+    }
+    return {'tp': tp, 'sl': sl};
+  }
+
+  void _showOrderDialog(Map<String, dynamic> stock, bool isBuy, {Map<String, dynamic>? existingOrder, bool isPositionMode = false, Map<String, dynamic>? tpOrder, Map<String, dynamic>? slOrder}) {
+    String? existingTpPrice;
+    String? existingSlPrice;
+
+    if (isPositionMode) {
+      if (tpOrder != null) existingTpPrice = tpOrder['stop_price'].toString();
+      if (slOrder != null) existingSlPrice = slOrder['stop_price'].toString();
+    } else if (existingOrder != null) {
+      final brackets = _getBracketsForDisplay(existingOrder, false);
+      if (brackets['tp'] != '-') existingTpPrice = brackets['tp'];
+      if (brackets['sl'] != '-') existingSlPrice = brackets['sl'];
+    }
+
     showDialog(
       context: context,
       builder: (BuildContext context) {
-        return PlaceOrderPage(stock: stock, isBuy: isBuy);
+        return PlaceOrderPage(
+          stock: stock,
+          isBuy: isBuy,
+          priceNotifier: _btcPriceNotifier,
+          accountBalance: _userBalanceUsd,
+          existingOrder: existingOrder,
+          existingTpOrder: tpOrder,
+          existingSlOrder: slOrder,
+          initialTargetPrice: existingTpPrice,
+          initialStopLossPrice: existingSlPrice,
+          isPositionMode: isPositionMode,
+        );
       },
     );
   }
 
-  Future<void> _updateOrder(Map<String, dynamic> position, Map<String, dynamic> order, String triggerPrice, String limitPrice, String orderType) async {
-    ShowDialogs.showProgressDialog();
+  // --- UPDATED: Edit Position Brackets ---
+  Future<void> _editPositionBrackets(Map<String, dynamic> position) async {
+    final productId = position['product_id'].toString();
+    final stock = _stocks.firstWhere((s) => s['code'].toString() == productId,
+        orElse: () => {'name': position['product_symbol'], 'code': position['product_id']});
 
-    try {
-      http.Response response;
-      final doc = order.isNotEmpty ? DBUtils.userDoc.reference.collection("ORDERS").doc(order['client_order_id']) : DBUtils.userDoc.reference.collection("ORDERS").doc();
-
-      if (order.isNotEmpty) {
-        // Update existing stop loss order
-        final payload = {
-          'id': order['id'],
-          'product_id': order['product_id'],
-          'product_symbol': order['product_symbol'],
-          'size': order['size'],
-          'stop_price': triggerPrice,
-          'limit_price': limitPrice,
-        };
-        response = await DeltaApi.put('/v2/orders', payload);
-      } else {
-        // Create new stop loss/take profit order
-        final isLong = position['size'] > 0;
-        final payload = {
-          'product_id': position['product_id'],
-          'product_symbol': position['product_symbol'],
-          'side': isLong ? 'sell' : 'buy',
-          'order_type': 'limit_order',
-          'size': position['size'].abs(),
-          'stop_order_type': orderType,
-          'stop_price': triggerPrice,
-          'limit_price': limitPrice,
-          'reduce_only': true,
-          'client_order_id': doc.id,
-        };
-        response = await DeltaApi.post('/v2/orders', payload);
-      }
-
-      ShowDialogs.dismissProgressDialog();
-      // Attempt to decode JSON, handle potential errors
-      dynamic responseBody;
+    // 1. Try to find Active Independent TP/SL orders
+    Map<String, dynamic>? findOrder(String type) {
       try {
-        responseBody = jsonDecode(response.body);
-      } on FormatException {
-        ShowDialogs.showDialog(title: 'Order Error', msg: 'Failed to parse order response (invalid JSON).');
-        return;
-      }
-
-      if (response.statusCode == 200) {
-        await doc.set(responseBody, SetOptions(merge: true));
-        ShowDialogs.showDialog(title: 'Success', msg: 'Order updated successfully.', type: DialogType.SUCCESS);
-      } else {
-        ShowDialogs.showDialog(title: 'Order Error', msg: responseBody['message'] ?? 'Failed to update order: HTTP ${response.statusCode}');
-      }
-    } on http.ClientException catch (e) {
-      ShowDialogs.dismissProgressDialog();
-      ShowDialogs.showDialog(title: 'Network Error', msg: 'Failed to connect to Delta Exchange: ${e.message}');
-    } catch (e) {
-      ShowDialogs.dismissProgressDialog();
-      ShowDialogs.showDialog(title: 'Order Error', msg: 'An unexpected error occurred while updating order: $e');
+        return _orders.firstWhere((o) =>
+        o['product_id'].toString() == productId &&
+            (o['state'] == 'open' || o['state'] == 'pending') &&
+            o['stop_order_type'] == type
+        );
+      } catch (e) { return null; }
     }
+
+    final tpOrder = findOrder('take_profit_order');
+    final slOrder = findOrder('stop_loss_order');
+
+    _showOrderDialog(
+      stock,
+      double.parse(position['size'].toString()) > 0,
+      existingOrder: position,
+      isPositionMode: true,
+      tpOrder: tpOrder,
+      slOrder: slOrder,
+    );
   }
-
-  Future<void> _updateBracketLeg(Map<String, dynamic> bracketOrder, _BracketLeg leg, String triggerPrice, String limitPrice) async {
-    if (triggerPrice.trim().isEmpty) {
-      ShowDialogs.showDialog(title: 'Invalid Input', msg: 'Trigger price is required for bracket orders.');
-      return;
-    }
-
-    final orderId = bracketOrder['id'] ?? bracketOrder['order_id'];
-    if (orderId == null) {
-      ShowDialogs.showDialog(title: 'Bracket Error', msg: 'Unable to identify bracket order.');
-      return;
-    }
-
-    ShowDialogs.showProgressDialog();
-
-    try {
-      final payload = <String, dynamic>{
-        'id': orderId,
-        'product_id': bracketOrder['product_id'],
-        'product_symbol': bracketOrder['product_symbol'],
-        'bracket_stop_trigger_method': bracketOrder['bracket_stop_trigger_method'] ?? 'last_traded_price',
-      };
-
-      if (leg == _BracketLeg.takeProfit) {
-        payload['bracket_take_profit_price'] = triggerPrice.trim();
-        final effectiveLimit = limitPrice.trim().isNotEmpty
-            ? limitPrice.trim()
-            : (bracketOrder['bracket_take_profit_limit_price']?.toString() ?? '');
-        if (effectiveLimit.isNotEmpty) {
-          payload['bracket_take_profit_limit_price'] = effectiveLimit;
-        }
-      } else {
-        payload['bracket_stop_loss_price'] = triggerPrice.trim();
-        final effectiveLimit = limitPrice.trim().isNotEmpty
-            ? limitPrice.trim()
-            : (bracketOrder['bracket_stop_loss_limit_price']?.toString() ?? '');
-        if (effectiveLimit.isNotEmpty) {
-          payload['bracket_stop_loss_limit_price'] = effectiveLimit;
-        }
-      }
-
-      final response = await DeltaApi.put('/v2/orders/bracket', payload);
-      dynamic responseBody;
-      try {
-        responseBody = jsonDecode(response.body);
-      } on FormatException {
-        ShowDialogs.dismissProgressDialog();
-        ShowDialogs.showDialog(title: 'Bracket Error', msg: 'Failed to parse bracket update response.');
-        return;
-      }
-
-      ShowDialogs.dismissProgressDialog();
-
-      if (response.statusCode == 200) {
-        ShowDialogs.showDialog(title: 'Success', msg: 'Bracket order updated successfully.', type: DialogType.SUCCESS);
-      } else {
-        ShowDialogs.showDialog(title: 'Bracket Error', msg: responseBody['message'] ?? 'Failed to update bracket order.');
-      }
-    } catch (e) {
-      ShowDialogs.dismissProgressDialog();
-      ShowDialogs.showDialog(title: 'Bracket Error', msg: 'An unexpected error occurred while updating bracket order.');
-    }
-  }
-
-  Future<void> _updateTrailAmount(Map<String, dynamic> position, Map<String, dynamic> order, String newTrailAmount) async {
-    ShowDialogs.showProgressDialog();
-
-    try {
-      http.Response? response;
-      final doc = order.isNotEmpty ? DBUtils.userDoc.reference.collection("ORDERS").doc(order['client_order_id']) : DBUtils.userDoc.reference.collection("ORDERS").doc();
-
-      bool place = true;
-      if (order.isNotEmpty) {
-        Map<String, dynamic> payload = {};
-        if (num.parse(order['trail_amount']?.toString() ?? '0') > 0){
-          payload = {
-            'id': order['id'],
-            'product_id': order['product_id'],
-            'product_symbol': order['product_symbol'],
-            'size': order['size'],
-            'trail_amount': newTrailAmount,
-          };
-          response = await DeltaApi.put('/v2/orders', payload);
-          place = false;
-        }else{
-          payload = {
-            'id': order['id'],
-            'client_order_id': order['client_order_id'],
-            'product_id': order['product_id'],
-          };
-          response = await DeltaApi.delete('/v2/orders', payload);
-        }
-      }
-      if (place){
-        final isLong = position['size'] > 0;
-        final payload = {
-          'product_id': position['product_id'],
-          'product_symbol': position['product_symbol'],
-          'side': isLong ? 'sell' : 'buy',
-          'order_type': 'market_order',
-          'stop_order_type': 'stop_loss_order',
-          'size': position['size'].abs(),
-          'trail_amount': newTrailAmount,
-          'client_order_id': doc.id,
-          'reduce_only': true,
-        };
-        response = await DeltaApi.post('/v2/orders', payload);
-      }
-
-      ShowDialogs.dismissProgressDialog();
-      // Attempt to decode JSON, handle potential errors
-      dynamic responseBody;
-      try {
-        responseBody = jsonDecode(response!.body);
-      } on FormatException {
-        ShowDialogs.showDialog(title: 'Trail Order Error', msg: 'Failed to parse trail order response (invalid JSON).');
-        return;
-      }
-
-      if (response.statusCode == 200) {
-        await doc.set(responseBody, SetOptions(merge: true));
-        ShowDialogs.showDialog(title: 'Success', msg: 'Trail amount updated successfully.', type: DialogType.SUCCESS);
-      } else {
-        ShowDialogs.showDialog(title: 'Trail Order Error', msg: responseBody['message'] ?? 'Failed to update trail amount: HTTP ${response.statusCode}');
-      }
-    } on http.ClientException catch (e) {
-      ShowDialogs.dismissProgressDialog();
-      ShowDialogs.showDialog(title: 'Network Error', msg: 'Failed to connect to Delta Exchange: ${e.message}');
-    } catch (e) {
-      ShowDialogs.dismissProgressDialog();
-      ShowDialogs.showDialog(title: 'Trail Order Error', msg: 'An unexpected error occurred while updating trail amount: $e');
-    }
-  }
-
-  void _onStockSelected(Map<String, dynamic> stock) {
-    _optionChainRefreshTimer?.cancel();
-    setState(() {
-      _selectedStock = stock;
-      _optionChainData = [];
-      _selectedExpiryDate = DateFormat('dd-MM-yyyy').format(DateTime.now());
-    });
-    _fetchOptionChainData();
-    _startOptionChainTimer();
-  }
-
-  void _startOptionChainTimer() {
-    _optionChainRefreshTimer = Timer.periodic(const Duration(minutes: 5), (timer) {
-      if (_selectedStock != null && _selectedExpiryDate != null) {
-        _fetchOptionChainData();
-      } else {
-        timer.cancel();
-      }
-    });
-  }
-
-  Future<void> _fetchOptionChainData() async {
-    if (_selectedStock == null || _selectedExpiryDate == null) return;
-
-    setState(() {
-      _isOptionChainLoading = true;
-    });
-
-    try {
-      final response = await DeltaApi.get('/v2/tickers?contract_types=call_options,put_options&underlying_asset_symbols=${_selectedStock!['short_name']}&expiry_date=$_selectedExpiryDate');
-
-      if (response.statusCode == 200) {
-        var data = jsonDecode(response.body);
-        final tickers = data['result'] as List;
-        if (tickers.isEmpty) {
-          setState(() {
-            _optionChainData = [];
-            _isOptionChainLoading = false;
-          });
-          ShowDialogs.showDialog(title: 'Info', msg: 'No option chain data found for the selected expiry date.');
-          return;
-        }
-
-        // Group by strike price
-        Map<String, Map<String, dynamic>> chain = {};
-        for (var ticker in tickers) {
-          final strike = ticker['strike_price'].toString();
-          if (!chain.containsKey(strike)) {
-            chain[strike] = {'strike_price': double.parse(strike)};
-          }
-          if (ticker['contract_type'] == 'call_options') {
-            chain[strike]!['call'] = ticker;
-          } else if (ticker['contract_type'] == 'put_options') {
-            chain[strike]!['put'] = ticker;
-          }
-        }
-
-        final sortedChain = chain.values.toList();
-        sortedChain.sort((a, b) => a['strike_price'].compareTo(b['strike_price']));
-
-        setState(() {
-          _optionChainData = List<Map<String, dynamic>>.from(sortedChain);
-          _spotPrice = double.parse(tickers.first['spot_price']?.toString() ?? '0.0');
-        });
-
-        _saveOiToFirestore(tickers);
-      } else {
-        ShowDialogs.showDialog(title: 'Error', msg: 'Failed to fetch option chain data: HTTP ${response.statusCode}');
-      }
-    } on http.ClientException catch (e) {
-      ShowDialogs.showDialog(title: 'Network Error', msg: 'Failed to connect to Delta Exchange: ${e.message}');
-    } on FormatException catch (e) {
-      ShowDialogs.showDialog(title: 'Data Error', msg: 'Failed to parse option chain data (invalid JSON): $e');
-    } catch (e) {
-      ShowDialogs.showDialog(title: 'Error', msg: 'An unexpected error occurred while fetching option chain data: $e');
-    }
-    finally {
-      if (mounted) {
-        setState(() {
-          _isOptionChainLoading = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _saveOiToFirestore(List<dynamic> tickers) async {
-    final docId = '${_selectedStock!['name']}_$_selectedExpiryDate';
-    final now = DateTime.now().toUtc();
-    final timestamp = now.toIso8601String();
-
-    final Map<String, dynamic> historyData = {};
-    for (var ticker in tickers) {
-      final strike = ticker['strike_price'].toString();
-      final type = ticker['contract_type'] == 'call_options' ? 'call' : 'put';
-      historyData['$strike-${type}_oi'] = ticker['oi'];
-      historyData['$strike-${type}_volume'] = ticker['volume_24h'];
-    }
-
-    try {
-      final docRef = FirebaseFirestore.instance.collection('option_chain_history').doc(docId);
-      await docRef.set({
-        'history': {
-          timestamp: historyData,
-        }
-      }, SetOptions(merge: true));
-    } catch (e) {
-      // This error will not be shown in a dialog as it is a background process.
-      // For production, consider using a proper logging solution.
-      // For now, I'll log it to the console for debugging.
-      print("Error saving option chain data to Firestore: $e");
-    }
-  }
-
 
   @override
   Widget build(BuildContext context) {
@@ -574,29 +305,20 @@ class _HomePageState extends State<HomePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Padding(
-                  padding: const EdgeInsets.all(24.0),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      const Text(
-                        'Dashboard',
-                        style: TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(width: 24),
-                      if (!_isLoading) _buildBitcoinCard(),
-                    ],
-                  ),
-                ),
+                _buildHeader(),
                 Expanded(
                   child: SingleChildScrollView(
                     padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        const Text('Open Positions', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 12),
                         _buildPositionsTable(),
-                        const SizedBox(height: 24),
-                        if (_selectedStock != null) _buildOptionChain(),
+                        const SizedBox(height: 32),
+                        const Text('Open Orders', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 12),
+                        _buildOpenOrdersTable(),
                       ],
                     ),
                   ),
@@ -605,66 +327,6 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildBitcoinCard() {
-    final btcStock = _stocks.firstWhere((s) => s['name'] == 'BTCUSD', orElse: () => {});
-    if (btcStock.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    return MouseRegion(
-      onEnter: (_) => setState(() => _isBitcoinCardHovered = true),
-      onExit: (_) => setState(() => _isBitcoinCardHovered = false),
-      child: InkWell(
-        onTap: () => _onStockSelected(btcStock),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1E2827),
-            borderRadius: BorderRadius.circular(8.0),
-            border: Border.all(color: Colors.white.withAlpha((255 * 0.1).round())),
-          ),
-          child: Row(
-            children: [
-              Text(
-                '${btcStock['name']}: ',
-                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              Text(
-                '${btcStock['ltp']}',
-                style: const TextStyle(color: Color(0xFF32F5A3), fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(width: 16),
-              if (_isBitcoinCardHovered)
-                Row(
-                  children: [
-                    OutlinedButton(
-                      onPressed: () => _showOrderDialog(btcStock, true),
-                      style: OutlinedButton.styleFrom(
-                          side: const BorderSide(color: Color(0xFF32F5A3)),
-                          minimumSize: const Size(40, 32),
-                          padding: EdgeInsets.zero,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4))),
-                      child: const Text('B', style: TextStyle(color: Color(0xFF32F5A3), fontWeight: FontWeight.bold)),
-                    ),
-                    const SizedBox(width: 8),
-                    OutlinedButton(
-                      onPressed: () => _showOrderDialog(btcStock, false),
-                      style: OutlinedButton.styleFrom(
-                          side: const BorderSide(color: Colors.redAccent),
-                          minimumSize: const Size(40, 32),
-                          padding: EdgeInsets.zero,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4))),
-                      child: const Text('S', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
-                    ),
-                  ],
-                ),
-            ],
-          ),
-        ),
       ),
     );
   }
@@ -735,7 +397,7 @@ class _HomePageState extends State<HomePage> {
               Utils.prefs.remove("PASS");
               Navigator.of(context).pushAndRemoveUntil(
                 MaterialPageRoute(builder: (context) => const LoginPage()),
-                (route) => false,
+                    (route) => false,
               );
             },
           ),
@@ -764,395 +426,212 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _buildTableHeader(List<String> headers, List<int> flexValues) {
+  Widget _buildHeader() {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+      padding: const EdgeInsets.all(24.0),
       child: Row(
-        children: List.generate(headers.length, (index) {
-          return Expanded(
-            flex: flexValues[index],
-            child: Text(headers[index], style: const TextStyle(color: Colors.white70, fontWeight: FontWeight.bold)),
-          );
-        }),
+        children: [
+          const Text('Dashboard', style: TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
+          const SizedBox(width: 12),
+          Container(width: 10, height: 10, decoration: BoxDecoration(shape: BoxShape.circle, color: _isConnected ? Colors.greenAccent : Colors.redAccent)),
+          const SizedBox(width: 24),
+          if (!_isLoading) _buildBitcoinCard(),
+          const Spacer(),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              const Text("Available Balance", style: TextStyle(color: Colors.white54, fontSize: 12)),
+              Row(
+                children: [
+                  Text("\$${Utils.round(2, num: _userBalanceUsd)}", style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(width: 8),
+                  Text("(₹${Utils.round(2, num: _userBalanceUsd * _usdToInr)})", style: const TextStyle(color: Colors.white70, fontSize: 14)),
+                ],
+              )
+            ],
+          )
+        ],
       ),
     );
   }
 
-  String _formatBracketPrice(dynamic trigger, dynamic limit) {
-    final triggerStr = trigger?.toString() ?? '';
-    final limitStr = limit?.toString() ?? '';
+  Widget _buildBitcoinCard() {
+    final btcStock = _stocks.firstWhere((s) => s['name'] == 'BTCUSD', orElse: () => {});
+    if (btcStock.isEmpty) return const SizedBox.shrink();
+    return GestureDetector(
+      onSecondaryTapUp: (details) {
+        showMenu(
+          context: context,
+          position: RelativeRect.fromLTRB(details.globalPosition.dx, details.globalPosition.dy, details.globalPosition.dx + 1, details.globalPosition.dy + 1),
+          color: const Color(0xFF1E2827),
+          items: [const PopupMenuItem(value: 'graphs', child: Text("View Option Chain Graphs", style: TextStyle(color: Colors.white)))],
+        ).then((v) { if (v == 'graphs') _openOptionChainWindow(btcStock['short_name'] ?? 'BTC'); });
+      },
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _isBitcoinCardHovered = true),
+        onExit: (_) => setState(() => _isBitcoinCardHovered = false),
+        child: InkWell(
+          onTap: () {},
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+            decoration: BoxDecoration(color: const Color(0xFF1E2827), borderRadius: BorderRadius.circular(8.0), border: Border.all(color: Colors.white.withOpacity(0.1))),
+            child: Row(
+              children: [
+                Text('${btcStock['name']}: ', style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                Text('${btcStock['ltp']}', style: const TextStyle(color: Color(0xFF32F5A3), fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(width: 16),
+                if (_isBitcoinCardHovered) Row(children: [
+                  OutlinedButton(onPressed: () => _showOrderDialog(btcStock, true), style: OutlinedButton.styleFrom(side: const BorderSide(color: Color(0xFF32F5A3))), child: const Text('B', style: TextStyle(color: Color(0xFF32F5A3)))),
+                  const SizedBox(width: 8),
+                  OutlinedButton(onPressed: () => _showOrderDialog(btcStock, false), style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.redAccent)), child: const Text('S', style: TextStyle(color: Colors.redAccent))),
+                ]),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
-    if (triggerStr.isEmpty && limitStr.isEmpty) {
-      return 'N/A';
+  Future<void> _closePosition(Map<String, dynamic> position) async {
+    ShowDialogs.showProgressDialog();
+    try {
+      final size = double.tryParse(position['size'].toString()) ?? 0;
+      if (size == 0) return;
+
+      // Close means creating a Market Order in the opposite direction
+      // reduce_only = true ensures it closes existing position and doesn't flip
+      final payload = {
+        'product_id': position['product_id'],
+        'size': size.abs().toInt(),
+        'side': size > 0 ? 'sell' : 'buy', // Opposite side
+        'order_type': 'market_order',
+        'reduce_only': true,
+      };
+
+      final response = await DeltaApi.post('/v2/orders', payload);
+      ShowDialogs.dismissProgressDialog();
+
+      if (response.statusCode == 200) {
+        ShowDialogs.showDialog(title: 'Success', msg: 'Position closed successfully.', type: DialogType.SUCCESS);
+      } else {
+        final body = jsonDecode(response.body);
+        ShowDialogs.showDialog(title: 'Error', msg: body['message'] ?? 'Failed to close position.');
+      }
+    } catch (e) {
+      ShowDialogs.dismissProgressDialog();
+      ShowDialogs.showDialog(title: 'Error', msg: 'Error closing position: $e');
     }
-
-    if (limitStr.isEmpty) {
-      return triggerStr;
-    }
-
-    return '$triggerStr/$limitStr';
   }
 
   Widget _buildPositionsTable() {
-    final headers = ['NAME', 'QTY', 'AVG PRICE', 'TARGET', 'STOP LOSS', 'TRAILING SL', ''];
+    final headers = ['NAME', 'QTY', 'AVG PRICE', 'TARGET', 'STOP LOSS', 'PnL', ''];
     final flexValues = [1, 1, 1, 2, 2, 2, 1];
 
     return Container(
       padding: const EdgeInsets.all(16.0),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [
-            const Color(0xFF1E2827).withAlpha((255 * 0.9).round()),
-            const Color(0xFF131A19).withAlpha((255 * 0.9).round()),
-          ],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(8.0),
-        border: Border.all(color: Colors.white.withAlpha((255 * 0.1).round())),
-      ),
+      decoration: BoxDecoration(color: const Color(0xFF1E2827).withOpacity(0.5), borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.white12)),
       child: Column(
         children: [
           _buildTableHeader(headers, flexValues),
           const Divider(color: Colors.white12, height: 1),
-          if (_positions.isEmpty)
-            const Padding(
-              padding: EdgeInsets.all(16.0),
-              child: Text('No open positions.', style: TextStyle(color: Colors.white70)),
-            )
-          else
-            ..._positions.asMap().entries.map((entry) {
-              int index = entry.key;
-              final position = entry.value;
-              final relevantOrders = _orders.where((o) => o['product_id'].toString() == position['product_id'].toString() && (o['state'] == 'open' || o['state'] == 'pending')).toList();
+          if (_positions.isEmpty) const Padding(padding: EdgeInsets.all(16.0), child: Text('No open positions.', style: TextStyle(color: Colors.white70)))
+          else ..._positions.asMap().entries.map((entry) {
+            int index = entry.key;
+            final position = entry.value;
+            final brackets = _getBracketsForDisplay(position, true);
 
-              var targetPrice = 'N/A';
-              var stopLossPrice = 'N/A';
-              Map<String, dynamic> takeProfitOrder = {};
-              Map<String, dynamic> stopLossOrder = {};
+            final stock = _stocks.firstWhere((s) => s['code'].toString() == position['product_id'].toString(), orElse: () => {});
+            double currentPrice = (stock.isNotEmpty && stock['ltp'] != 'N/A') ? double.tryParse(stock['ltp'].toString()) ?? 0.0 : 0.0;
+            double entryPrice = double.tryParse(position['entry_price'].toString()) ?? 0.0;
+            double size = double.tryParse(position['size'].toString()) ?? 0.0;
 
-              final bracketOrder = relevantOrders.firstWhere((o) => o['bracket_order'] == true, orElse: () => {});
-              final hasBracket = bracketOrder.isNotEmpty;
+            double rawPnl = 0.0;
+            if (currentPrice > 0 && entryPrice > 0) {
+              if (size > 0) rawPnl = (currentPrice - entryPrice) * size.abs() * 0.001;
+              else rawPnl = (entryPrice - currentPrice) * size.abs() * 0.001;
+            }
+            Color pnlColor = rawPnl >= 0 ? Colors.greenAccent : Colors.redAccent;
 
-              if (hasBracket) {
-                targetPrice = _formatBracketPrice(bracketOrder['bracket_take_profit_price'], bracketOrder['bracket_take_profit_limit_price']);
-                stopLossPrice = _formatBracketPrice(bracketOrder['bracket_stop_loss_price'], bracketOrder['bracket_stop_loss_limit_price']);
-              } else {
-                takeProfitOrder = relevantOrders.firstWhere((o) => o['stop_order_type'] == 'take_profit_order', orElse: () => {});
-                if (takeProfitOrder.isNotEmpty) {
-                  targetPrice = "${takeProfitOrder['stop_price'] ?? ''}/${takeProfitOrder['limit_price'] ?? ''}";
-                }
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              color: index % 2 == 0 ? Colors.transparent : Colors.white.withOpacity(0.02),
+              child: Row(
+                children: [
+                  Expanded(flex: flexValues[0], child: Text(position['product_symbol'].toString(), style: const TextStyle(color: Colors.white))),
+                  Expanded(flex: flexValues[1], child: Text(position['size'].toString(), style: const TextStyle(color: Colors.white))),
+                  Expanded(flex: flexValues[2], child: Text(Utils.round(2, s: position['entry_price']), style: const TextStyle(color: Colors.white))),
+                  Expanded(flex: flexValues[3], child: Row(children: [Text(brackets['tp']!, style: const TextStyle(color: Colors.white)), const SizedBox(width: 4), InkWell(onTap: () => _editPositionBrackets(position), child: const Icon(Icons.edit, color: Colors.white54, size: 14))])),
+                  Expanded(flex: flexValues[4], child: Row(children: [Text(brackets['sl']!, style: const TextStyle(color: Colors.white)), const SizedBox(width: 4), InkWell(onTap: () => _editPositionBrackets(position), child: const Icon(Icons.edit, color: Colors.white54, size: 14))])),
+                  Expanded(flex: flexValues[5], child: Text("${rawPnl >= 0 ? '+' : ''}\$${Utils.round(2, num: rawPnl)}", style: TextStyle(color: pnlColor, fontWeight: FontWeight.bold))),
 
-                stopLossOrder = relevantOrders.firstWhere((o) => o['stop_order_type'] == 'stop_loss_order', orElse: () => {});
-                if (stopLossOrder.isNotEmpty) {
-                  stopLossPrice = "${stopLossOrder['stop_price'] ?? ''}/${stopLossOrder['limit_price'] ?? ''}";
-                }
-              }
-
-              final trailOrder = relevantOrders.firstWhere((o) => o['trail_amount'] != null, orElse: () => {});
-              final trailAmount = trailOrder['trail_amount']?.toString() ?? '0.0';
-
-              final entryPrice = double.tryParse(position['entry_price'].toString()) ?? 0.0;
-
-              return MouseRegion(
-                onEnter: (_) => setState(() => _hoveredPositionIndex = index),
-                onExit: (_) => setState(() => _hoveredPositionIndex = -1),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-                  color: _hoveredPositionIndex == index ? const Color(0xFF2B403F).withAlpha((255 * 0.5).round()) : Colors.transparent,
-                  child: Row(
-                    children: [
-                      Expanded(flex: flexValues[0], child: Text(position['product_symbol'].toString(), style: const TextStyle(color: Colors.white))),
-                      Expanded(flex: flexValues[1], child: Text(position['size'].toString(), style: const TextStyle(color: Colors.white))),
-                      Expanded(flex: flexValues[2], child: Text(entryPrice.toStringAsFixed(2), style: const TextStyle(color: Colors.white))),
-                      Expanded(
-                        flex: flexValues[3],
-                        child: Row(
-                          children: [
-                            Text(targetPrice, style: const TextStyle(color: Colors.white)),
-                            const SizedBox(width: 4),
-                            InkWell(
-                              onTap: () {
-                                showDialog(
-                                  context: context,
-                                  builder: (context) => EditOrderDialog(
-                                    initialTriggerPrice: hasBracket
-                                        ? bracketOrder['bracket_take_profit_price']?.toString()
-                                        : takeProfitOrder['stop_price']?.toString(),
-                                    initialLimitPrice: hasBracket
-                                        ? bracketOrder['bracket_take_profit_limit_price']?.toString()
-                                        : takeProfitOrder['limit_price']?.toString(),
-                                    onSave: (trigger, limit) {
-                                      if (hasBracket) {
-                                        _updateBracketLeg(bracketOrder, _BracketLeg.takeProfit, trigger, limit);
-                                      } else {
-                                        _updateOrder(position, takeProfitOrder, trigger, limit, 'take_profit_order');
-                                      }
-                                    },
-                                  ),
-                                );
-                              },
-                              child: const Icon(Icons.edit, color: Colors.white54, size: 16),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Expanded(
-                        flex: flexValues[4],
-                        child: Row(
-                          children: [
-                            Text(stopLossPrice, style: const TextStyle(color: Colors.white)),
-                            const SizedBox(width: 4),
-                            InkWell(
-                              onTap: () {
-                                showDialog(
-                                  context: context,
-                                  builder: (context) => EditOrderDialog(
-                                    initialTriggerPrice: hasBracket
-                                        ? bracketOrder['bracket_stop_loss_price']?.toString()
-                                        : stopLossOrder['stop_price']?.toString(),
-                                    initialLimitPrice: hasBracket
-                                        ? bracketOrder['bracket_stop_loss_limit_price']?.toString()
-                                        : stopLossOrder['limit_price']?.toString(),
-                                    onSave: (trigger, limit) {
-                                      if (hasBracket) {
-                                        _updateBracketLeg(bracketOrder, _BracketLeg.stopLoss, trigger, limit);
-                                      } else {
-                                        _updateOrder(position, stopLossOrder, trigger, limit, 'stop_loss_order');
-                                      }
-                                    },
-                                  ),
-                                );
-                              },
-                              child: const Icon(Icons.edit, color: Colors.white54, size: 16),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Expanded(
-                          flex: flexValues[5],
-                          child: EditableCell(
-                            initialValue: trailAmount,
-                            onSubmitted: (newTrailAmount) => _updateTrailAmount(position, trailOrder, newTrailAmount),
-                          )),
-                      Expanded(
-                        flex: flexValues[6],
-                        child: Row(
-                          children: [
-                            const SizedBox(width: 8),
-                            Visibility(
-                              visible: _hoveredPositionIndex == index,
-                              maintainState: true,
-                              maintainAnimation: true,
-                              maintainSize: true,
-                              child: Align(
-                                alignment: Alignment.centerLeft,
-                                child: OutlinedButton(
-                                  onPressed: () {},
-                                  style: OutlinedButton.styleFrom(
-                                    side: const BorderSide(color: Colors.redAccent),
-                                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
-                                  ),
-                                  child: const Text('Close', style: TextStyle(color: Colors.redAccent)),
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            }),
+                  // CLOSE BUTTON
+                  Expanded(flex: flexValues[6], child: OutlinedButton(
+                      onPressed: () => _closePosition(position),
+                      style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.redAccent), padding: EdgeInsets.zero, minimumSize: const Size(60, 30)),
+                      child: const Text('Close', style: TextStyle(color: Colors.redAccent, fontSize: 12))
+                  )),
+                ],
+              ),
+            );
+          }),
         ],
       ),
     );
   }
 
-  Widget _buildOptionChain() {
+  Widget _buildOpenOrdersTable() {
+    final headers = ['TIME', 'SYMBOL', 'TYPE', 'SIDE', 'PRICE', 'QTY', 'TARGET', 'STOP LOSS', 'STATUS', 'ACTIONS'];
+    final flexValues = [2, 1, 1, 1, 1, 1, 1, 1, 1, 2];
+    final openOrders = _orders.where((o) => (o['state'] == 'open' || o['state'] == 'pending') && (o['stop_order_type'] == null)).toList();
+    openOrders.sort((a, b) => (b['created_at'] is int ? b['created_at'] : 0).compareTo(a['created_at'] is int ? a['created_at'] : 0));
+
     return Container(
       padding: const EdgeInsets.all(16.0),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [
-            const Color(0xFF1E2827).withAlpha((255 * 0.9).round()),
-            const Color(0xFF131A19).withAlpha((255 * 0.9).round()),
-          ],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(8.0),
-        border: Border.all(color: Colors.white.withAlpha((255 * 0.1).round())),
-      ),
+      decoration: BoxDecoration(color: const Color(0xFF1E2827).withOpacity(0.5), borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.white12)),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            _selectedStock != null ? 'Option Chain for ${_selectedStock!['name']}' : 'Select a stock to view its Option Chain',
-            style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 16),
-          if (_selectedStock != null) ..._buildOptionChainContent(),
+          _buildTableHeader(headers, flexValues),
+          const Divider(color: Colors.white12, height: 1),
+          if (openOrders.isEmpty) const Padding(padding: EdgeInsets.all(16.0), child: Text('No open orders.', style: TextStyle(color: Colors.white70)))
+          else ...openOrders.asMap().entries.map((entry) {
+            int index = entry.key;
+            final order = entry.value;
+            DateTime date;
+            if (order['created_at'] is int) date = DateTime.fromMillisecondsSinceEpoch(order['created_at'] ~/ 1000);
+            else if (order['created_at'] is String) date = DateTime.tryParse(order['created_at']) ?? DateTime.now();
+            else date = DateTime.now();
+            final timeStr = DateFormat('MM-dd HH:mm').format(date);
+            final isBuy = order['side'] == 'buy';
+            final brackets = _getBracketsForDisplay(order, false);
+
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              color: index % 2 == 0 ? Colors.transparent : Colors.white.withOpacity(0.02),
+              child: Row(
+                children: [
+                  Expanded(flex: flexValues[0], child: Text(timeStr, style: const TextStyle(color: Colors.white70, fontSize: 12))),
+                  Expanded(flex: flexValues[1], child: Text(order['product_symbol'], style: const TextStyle(color: Colors.white))),
+                  Expanded(flex: flexValues[2], child: Text(order['order_type'].toString().replaceAll('_order', '').toUpperCase(), style: const TextStyle(color: Colors.white70, fontSize: 12))),
+                  Expanded(flex: flexValues[3], child: Text(order['side'].toString().toUpperCase(), style: TextStyle(color: isBuy ? Colors.greenAccent : Colors.redAccent, fontWeight: FontWeight.bold))),
+                  Expanded(flex: flexValues[4], child: Text(order['limit_price'] ?? 'MKT', style: const TextStyle(color: Colors.white))),
+                  Expanded(flex: flexValues[5], child: Text(order['size'].toString(), style: const TextStyle(color: Colors.white))),
+                  Expanded(flex: flexValues[6], child: Text(brackets['tp']!, style: const TextStyle(color: Colors.white, fontSize: 12))),
+                  Expanded(flex: flexValues[7], child: Text(brackets['sl']!, style: const TextStyle(color: Colors.white, fontSize: 12))),
+                  Expanded(flex: flexValues[8], child: Text(order['state'], style: const TextStyle(color: Colors.orangeAccent, fontSize: 12))),
+                  Expanded(flex: flexValues[9], child: Row(children: [
+                    IconButton(icon: const Icon(Icons.edit, color: Colors.blueAccent, size: 18), onPressed: () { final stock = _stocks.firstWhere((s) => s['name'] == order['product_symbol'], orElse: () => {'name': order['product_symbol'], 'code': order['product_id']}); _showOrderDialog(stock, isBuy, existingOrder: order); }),
+                    IconButton(icon: const Icon(Icons.cancel, color: Colors.redAccent, size: 18), onPressed: () => DeltaApi.cancelOrder(order['id'].toString(), order['product_id'].toString())),
+                  ])),
+                ],
+              ),
+            );
+          }),
         ],
       ),
     );
   }
 
-  List<Widget> _buildOptionChainContent() {
-    if (_isOptionChainLoading) {
-      return [const Center(child: CircularProgressIndicator())];
-    } else if (_selectedExpiryDate == null) {
-      return [_buildDatePickerButton()];
-    } else if (_optionChainData.isEmpty && !_isOptionChainLoading) {
-      return [
-        _buildDatePickerButton(),
-        const SizedBox(height: 16),
-        const Center(child: Text('No option chain data for this expiry date.', style: TextStyle(color: Colors.white70)))
-      ];
-    } else {
-      return [
-        _buildDatePickerButton(),
-        const SizedBox(height: 16),
-        Column(
-          children: [
-            const Text('Call & Put Volumes', style: TextStyle(color: Colors.white, fontSize: 16)),
-            const SizedBox(height: 8),
-            VolumeChart(underlyingAsset: _selectedStock!['name'], expiryDate: _selectedExpiryDate!),
-            const SizedBox(height: 24),
-            const Text('Change in OI over Time', style: TextStyle(color: Colors.white, fontSize: 16)),
-            const SizedBox(height: 8),
-            OiChart(underlyingAsset: _selectedStock!['name'], expiryDate: _selectedExpiryDate!),
-          ],
-        ),
-      ];
-    }
-  }
-
-  Widget _buildDatePickerButton() {
-    return Center(
-      child: OutlinedButton(
-        onPressed: () async {
-          final DateTime? picked = await showDatePicker(
-            context: context,
-            initialDate: DateTime.now(),
-            firstDate: DateTime(2000),
-            lastDate: DateTime(2101),
-          );
-          if (picked != null) {
-            final formattedDate = DateFormat('dd-MM-yyyy').format(picked);
-            setState(() {
-              _selectedExpiryDate = formattedDate;
-            });
-            _optionChainRefreshTimer?.cancel();
-            _fetchOptionChainData();
-            _startOptionChainTimer();
-          }
-        },
-        style: OutlinedButton.styleFrom(
-          side: const BorderSide(color: Colors.white24),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20.0),
-          ),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-          child: Text(
-            _selectedExpiryDate ?? 'Select Expiry Date',
-            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class EditableCell extends StatefulWidget {
-  const EditableCell({super.key, required this.initialValue, required this.onSubmitted});
-
-  final String initialValue;
-  final Function(String) onSubmitted;
-
-  @override
-  State<EditableCell> createState() => _EditableCellState();
-}
-
-class _EditableCellState extends State<EditableCell> {
-  late TextEditingController _controller;
-  bool _isEditing = false;
-  String _value = '';
-
-  @override
-  void initState() {
-    super.initState();
-    _value = widget.initialValue;
-    _controller = TextEditingController(text: _value);
-  }
-
-  @override
-  void didUpdateWidget(EditableCell oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.initialValue != oldWidget.initialValue) {
-      setState(() {
-        _value = widget.initialValue;
-        _controller.text = _value;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return _isEditing
-        ? SizedBox(
-            width: 80,
-            height: 32,
-            child: TextField(
-              controller: _controller,
-              autofocus: true,
-              keyboardType: TextInputType.number,
-              textAlignVertical: TextAlignVertical.center,
-              style: const TextStyle(color: Colors.white, fontSize: 14),
-              decoration: InputDecoration(
-                isCollapsed: true,
-                filled: true,
-                fillColor: const Color(0xFF131A19),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(4.0),
-                  borderSide: BorderSide(color: Colors.white.withAlpha((255 * 0.2).round())),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(4.0),
-                  borderSide: BorderSide(color: Colors.white.withAlpha((255 * 0.2).round())),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(4.0),
-                  borderSide: const BorderSide(color: Color(0xFF32F5A3)),
-                ),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 8.0),
-              ),
-              onSubmitted: (newValue) {
-                setState(() {
-                  _value = newValue;
-                  _isEditing = false;
-                });
-                widget.onSubmitted(newValue);
-              },
-            ),
-          )
-        : Row(
-            children: [
-              Text(_value, style: const TextStyle(color: Colors.white)),
-              const SizedBox(width: 4),
-              InkWell(
-                onTap: () {
-                  setState(() {
-                    _isEditing = true;
-                  });
-                },
-                child: const Icon(Icons.edit, color: Colors.white54, size: 16),
-              ),
-            ],
-          );
-  }
+  Widget _buildTableHeader(List<String> h, List<int> f) { return Row(children: List.generate(h.length, (i) => Expanded(flex: f[i], child: Text(h[i], style: const TextStyle(color: Colors.white54, fontSize: 12))))); }
+  @override void dispose() { _reconnectTimer?.cancel(); _channel?.sink.close(); super.dispose(); }
 }

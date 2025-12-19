@@ -49,6 +49,9 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
   bool _targetTriggerEnabled = false;
   bool _isTrailingSlEnabled = false;
 
+  // NEW: Track if the parent order already has a bracket attached
+  bool _hasExistingBracket = false;
+
   CalculationMode _selectedMode = CalculationMode.price;
 
   final _quantityController = TextEditingController(text: "1");
@@ -94,6 +97,19 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
             _limitPriceController.text = widget.existingOrder!['limit_price'] ?? '0.0';
           } else {
             _isMarketOrder = true;
+          }
+        }
+
+        // --- NEW: Detect Existing Bracket on Parent Order ---
+        if (widget.existingOrder!.containsKey('bracket_take_profit_price') ||
+            widget.existingOrder!.containsKey('bracket_stop_loss_price') ||
+            widget.existingOrder!.containsKey('bracket_trail_amount')) {
+
+          // Check if values are actually set (not null)
+          if (widget.existingOrder!['bracket_take_profit_price'] != null ||
+              widget.existingOrder!['bracket_stop_loss_price'] != null ||
+              widget.existingOrder!['bracket_trail_amount'] != null) {
+            _hasExistingBracket = true;
           }
         }
       }
@@ -318,6 +334,89 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
     });
   }
 
+  /// --- LOGIC: Independent Order Handling (Position Mode) ---
+  Future<void> _handleIndependentOrder({
+    required Map<String, dynamic>? existingOrder,
+    required bool isEnabled,
+    required String value, // Price OR Trail Amount
+    required String type,
+    bool isTrailing = false,
+  }) async {
+    if (isEnabled && existingOrder != null) {
+      // 1. Check for Type Mismatch (Standard vs Trailing)
+      // Delta cannot change type via PUT. Must cancel and create new.
+      bool typeMismatch = false;
+      if (isTrailing &&
+          existingOrder['order_type'] != 'trailing_stop_loss_order')
+        typeMismatch = true;
+      if (!isTrailing &&
+          existingOrder['order_type'] == 'trailing_stop_loss_order')
+        typeMismatch = true;
+
+      if (typeMismatch) {
+        await DeltaApi.delete('/v2/orders', {
+          'id': existingOrder['id'].toString(),
+          'product_id': int.parse(widget.stock['code'].toString()),
+        });
+        // Recursively create new
+        await _handleIndependentOrder(
+          existingOrder: null,
+          isEnabled: true,
+          value: value,
+          type: type,
+          isTrailing: isTrailing,
+        );
+        return;
+      }
+
+      // 2. Normal Update
+      final payload = {
+        'id': int.parse(existingOrder['id'].toString()),
+        'product_id': widget.stock['code'],
+        'size': int.tryParse(_quantityController.text) ?? 0,
+      };
+
+      if (isTrailing) {
+        payload['trail_amount'] = value;
+      } else {
+        if (existingOrder['order_type'] == 'limit_order')
+          payload['limit_price'] = value;
+        else
+          payload['stop_price'] = value;
+      }
+
+      await DeltaApi.put('/v2/orders', payload);
+    } else if (isEnabled && existingOrder == null) {
+      // 3. CREATE NEW INDEPENDENT ORDER (Attach to Position via reduce_only)
+      final payload = {
+        'product_id': widget.stock['code'],
+        'size': int.tryParse(_quantityController.text) ?? 0,
+        'side': _isBuy ? 'sell' : 'buy', // Opposite of position
+        'reduce_only': true,
+        'stop_order_type': type == 'take_profit'
+            ? 'take_profit_order'
+            : 'stop_loss_order',
+      };
+
+      if (isTrailing) {
+        payload['order_type'] = 'trailing_stop_loss_order';
+        payload['trail_amount'] = value;
+      } else {
+        payload['order_type'] = 'market_order'; // Stop Market
+        payload['stop_price'] = value;
+      }
+
+      await DeltaApi.post('/v2/orders', payload);
+    } else if (!isEnabled && existingOrder != null) {
+      // 4. CANCEL EXISTING
+      final payload = {
+        'id': existingOrder['id'].toString(),
+        'product_id': int.parse(widget.stock['code'].toString()),
+      };
+      await DeltaApi.delete('/v2/orders', payload);
+    }
+  }
+
   Future<void> _placeOrder() async {
     ShowDialogs.showProgressDialog();
     try {
@@ -326,53 +425,50 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
           : DBUtils.userDoc.reference.collection("ORDERS").doc();
 
       // ============================================================
-      // 1. POSITION MODE (Brackets on Active Position)
+      // 1. POSITION MODE
       // ============================================================
       if (widget.isPositionMode) {
-        // A. If Independent Bracket Orders exist -> Manage them
-        if (widget.existingTpOrder != null) {
-          await DeltaApi.cancelOrder(widget.existingTpOrder!['id'].toString(), widget.stock['code'].toString(), false);
+        // A. If Independent Bracket Orders exist, manage them (Fallback/Standard)
+        if (widget.existingTpOrder != null || widget.existingSlOrder != null) {
+          await _handleIndependentOrder(
+            existingOrder: widget.existingTpOrder,
+            isEnabled: _targetTriggerEnabled,
+            value: _targetTriggerPriceController.text,
+            type: 'take_profit',
+          );
+          await _handleIndependentOrder(
+            existingOrder: widget.existingSlOrder,
+            isEnabled: _stopLossEnabled,
+            value: _stopLossTriggerPriceController.text,
+            type: 'stop_loss',
+            isTrailing: _isTrailingSlEnabled,
+          );
         }
-
-        if (widget.existingSlOrder != null) {
-          await DeltaApi.cancelOrder(widget.existingSlOrder!['id'].toString(), widget.stock['code'].toString(), false);
-        }
-
-        final bracketPayload = <String, dynamic>{
-          'product_id': widget.stock['code'],
-          'product_symbol': widget.stock['name'],
-          'bracket_stop_trigger_method': 'last_traded_price',
-        };
-
-        // --- DECISION: POST (Create New) vs PUT (Edit Existing) ---
-        final dynamic response;
-
-        if (_targetTriggerEnabled) {
-          bracketPayload['take_profit_order'] = {
-            'order_type': 'market_order',
-            'stop_price': _targetTriggerPriceController.text,
+        // B. If NO Active Brackets but we have a Parent ID, use ATTACH BRACKET Endpoint
+        else if (widget.existingOrder != null && widget.existingOrder!['id'] != null) {
+          final bracketPayload = <String, dynamic>{
+            'id': int.parse(widget.existingOrder!['id'].toString()),
+            'product_id': widget.stock['code'],
+            'product_symbol': widget.stock['name'],
+            'bracket_stop_trigger_method': 'last_traded_price',
           };
-        }
-        if (_stopLossEnabled) {
-          final slOrder = <String, dynamic>{
-            'order_type': 'market_order'
-          };
+          if (_targetTriggerEnabled) bracketPayload['bracket_take_profit_price'] = _targetTriggerPriceController.text;
 
-          if (_isTrailingSlEnabled) {
-            slOrder['trail_amount'] = "-${_stopLossTriggerPriceController.text}";
-          } else {
-            slOrder['stop_price'] = _stopLossTriggerPriceController.text;
+          if (_stopLossEnabled) {
+            if (_isTrailingSlEnabled) {
+              bracketPayload['bracket_trail_amount'] = _stopLossTriggerPriceController.text;
+            } else {
+              bracketPayload['bracket_stop_loss_price'] = _stopLossTriggerPriceController.text;
+            }
           }
-          bracketPayload['stop_loss_order'] = slOrder;
+          var response = await DeltaApi.put('/v2/orders/bracket', bracketPayload);
+          var data = jsonDecode(response.body);
+          if (response.statusCode == 200){}
         }
-
-        response = await DeltaApi.post('/v2/orders/bracket', bracketPayload);
-
-        if (response.statusCode != 200) {
-          ShowDialogs.dismissProgressDialog();
-          final body = jsonDecode(response.body);
-          ShowDialogs.showDialog(title: 'Error', msg: body['message'] ?? 'Failed to update bracket.');
-          return;
+        else {
+          // No Parent ID and No Active Brackets? Force Independent Orders (Create New)
+          await _handleIndependentOrder(existingOrder: null, isEnabled: _targetTriggerEnabled, value: _targetTriggerPriceController.text, type: 'take_profit');
+          await _handleIndependentOrder(existingOrder: null, isEnabled: _stopLossEnabled, value: _stopLossTriggerPriceController.text, type: 'stop_loss', isTrailing: _isTrailingSlEnabled);
         }
 
         ShowDialogs.dismissProgressDialog();
@@ -382,7 +478,7 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
       }
 
       // ============================================================
-      // 2. ORDER EDIT MODE (Update Pending Main Order)
+      // 2. ORDER EDIT MODE
       // ============================================================
       if (_isEditMode && !widget.isPositionMode) {
         final updatePayload = {
@@ -399,7 +495,6 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
           return;
         }
 
-        // Update Brackets on Pending Order (Use Flattened PUT)
         if (_targetTriggerEnabled || _stopLossEnabled) {
           final bracketPayload = <String, dynamic>{
             'id': int.parse(widget.existingOrder!['id'].toString()),
@@ -408,7 +503,6 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
             'bracket_stop_trigger_method': 'last_traded_price',
           };
           if (_targetTriggerEnabled) bracketPayload['bracket_take_profit_price'] = _targetTriggerPriceController.text;
-
           if (_stopLossEnabled) {
             if (_isTrailingSlEnabled) bracketPayload['bracket_trail_amount'] = _stopLossTriggerPriceController.text;
             else bracketPayload['bracket_stop_loss_price'] = _stopLossTriggerPriceController.text;
@@ -423,7 +517,7 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
       }
 
       // ============================================================
-      // 3. NEW ORDER MODE (Place Main Order + Brackets)
+      // 3. NEW ORDER MODE
       // ============================================================
       final payload = <String, dynamic>{
         'product_id': widget.stock['code'],
@@ -436,36 +530,22 @@ class _PlaceOrderPageState extends State<PlaceOrderPage> {
 
       if (!_isMarketOrder) payload['limit_price'] = _limitPriceController.text;
 
-      // Use NESTED OBJECTS for POST /v2/orders
       if (_targetTriggerEnabled || _stopLossEnabled) {
         payload['bracket_stop_trigger_method'] = 'last_traded_price';
       }
 
       if (_targetTriggerEnabled) {
-        payload['take_profit_order'] = {
-          'order_type': 'market_order',
-          'stop_price': _targetTriggerPriceController.text,
-        };
-        if (_targetLimitPriceController.text.isNotEmpty) {
-          payload['take_profit_order']['order_type'] = 'limit_order';
-          payload['take_profit_order']['limit_price'] = _targetLimitPriceController.text;
-        }
+        payload['bracket_take_profit_price'] = _targetTriggerPriceController.text;
       }
 
       if (_stopLossEnabled) {
-        final slOrder = <String, dynamic>{};
         if (_isTrailingSlEnabled) {
-          slOrder['order_type'] = 'trailing_stop_loss_order';
-          slOrder['trail_amount'] = _stopLossTriggerPriceController.text;
+          // SEND TRAIL AMOUNT
+          payload['bracket_trail_amount'] = _stopLossTriggerPriceController.text;
         } else {
-          slOrder['order_type'] = 'market_order';
-          slOrder['stop_price'] = _stopLossTriggerPriceController.text;
-          if (_stopLossLimitPriceController.text.isNotEmpty) {
-            slOrder['order_type'] = 'limit_order';
-            slOrder['limit_price'] = _stopLossLimitPriceController.text;
-          }
+          // SEND STOP PRICE
+          payload['bracket_stop_loss_price'] = _stopLossTriggerPriceController.text;
         }
-        payload['stop_loss_order'] = slOrder;
       }
 
       final response = await DeltaApi.post('/v2/orders', payload);

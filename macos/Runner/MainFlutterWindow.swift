@@ -1,5 +1,6 @@
 import Cocoa
 import FlutterMacOS
+import desktop_multi_window
 
 class MainFlutterWindow: NSWindow {
   override func awakeFromNib() {
